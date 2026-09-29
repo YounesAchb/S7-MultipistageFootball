@@ -1,0 +1,21 @@
+# Dossiers de compilation
+build/
+bin/
+out/
+CMakeFiles/
+CMakeCache.txt
+multipistage
+multipistage.exe
+edgetrack
+edgetrack.exe
+edgetrack-foot
+
+# Fichiers système macOS
+.DS_Store
+
+# Fichiers vidéo lourds (ne pas commiter dans Git)
+*.mp4
+*.avi
+*.mkv
+videos/
+data/videos/
