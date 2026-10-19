@@ -2,83 +2,103 @@
 #include <string>
 #include <vector>
 #include <algorithm>
-#include <array>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <stdexcept>
 #include <cmath>
 #include <opencv2/opencv.hpp>
-//Normalisation à la main 
-void normaliserMinMax(cv::Mat& canal)
+
+#include "traitements_image.hpp"
+
+namespace {
+enum class ModeNormalisation { Manuel, OpenCV, Aucune };
+
+struct Options {
+    std::string video = "data/videos/clip1.mp4";
+    ModeNormalisation mode = ModeNormalisation::Manuel;
+    bool affichage = true;
+    int maximum_images = 0; // 0 signifie : lire la video jusqu'a la fin.
+    std::filesystem::path sortie;
+};
+
+const char* nomMode(ModeNormalisation mode)
 {
-    int minimum = 255;
-    int maximum = 0;
-
-    // Premiere passe : chercher les valeurs minimale et maximale.
-    for (int y = 0; y < canal.rows; ++y) {
-        const uchar* pixels = canal.ptr<uchar>(y);
-
-        for (int x = 0; x < canal.cols; ++x) {
-            int valeur = pixels[x];
-
-            if (valeur < minimum) minimum = valeur;
-            if (valeur > maximum) maximum = valeur;
-        }
-    }
-
-    const int etendue = maximum - minimum;
-
-    // Deuxieme passe : appliquer la formule a chaque pixel.
-    for (int y = 0; y < canal.rows; ++y) {
-        uchar* pixels = canal.ptr<uchar>(y);
-
-        for (int x = 0; x < canal.cols; ++x) {
-            if (etendue == 0) {
-                pixels[x] = 0;
-            } else {
-                double valeur = 255.0 * (pixels[x] - minimum) / etendue;
-                pixels[x] = static_cast<uchar>(std::lround(valeur));
-            }
-        }
-    }
+    if (mode == ModeNormalisation::OpenCV) return "opencv";
+    if (mode == ModeNormalisation::Aucune) return "aucune";
+    return "manuel";
 }
 
-void egaliserHistogramme(cv::Mat& canal)
+void afficherAide()
 {
-    if (canal.empty()) return;
-    CV_Assert(canal.type() == CV_8UC1);
-
-    std::array<std::size_t, 256> histogramme{};
-    for (int y = 0; y < canal.rows; ++y) {
-        const uchar* pixels = canal.ptr<uchar>(y);
-        for (int x = 0; x < canal.cols; ++x) {
-            ++histogramme[pixels[x]];
-        }
-    }
-
-    int premier_niveau = 0;
-    while (histogramme[premier_niveau] == 0) ++premier_niveau;
-    const std::size_t total = canal.total();
-    const std::size_t cumul_min = histogramme[premier_niveau];
-    if (total == cumul_min) return;
-
-    // Retirer le premier cumul permet de faire correspondre le minimum a 0.
-    std::array<uchar, 256> correspondance{};
-    std::size_t cumul = 0;
-    for (int niveau = premier_niveau + 1; niveau < 256; ++niveau) {
-        cumul += histogramme[niveau];
-        const double valeur = 255.0 * cumul / (total - cumul_min);
-        correspondance[niveau] = static_cast<uchar>(std::lround(valeur));
-    }
-
-    for (int y = 0; y < canal.rows; ++y) {
-        uchar* pixels = canal.ptr<uchar>(y);
-        for (int x = 0; x < canal.cols; ++x) {
-            pixels[x] = correspondance[pixels[x]];
-        }
-    }
+    std::cout << "Usage : detourage_terrain [video] [options]\n"
+              << "  --normalisation manuel|opencv|aucune (defaut : manuel)\n"
+              << "  --sans-affichage      teste sans ouvrir de fenetre\n"
+              << "  --max-images N        limite le nombre d'images traitees\n"
+              << "  --sortie DOSSIER      exporte CSV et captures de verification\n"
+              << "  --help                affiche cette aide\n";
 }
 
-int main(int argc, char* argv[])
+Options lireOptions(int argc, char* argv[])
 {
-    const std::string chemin_video = argc > 1 ? argv[1] : "data/videos/clip1.mp4";
+    Options options;
+    bool video_fournie = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string argument = argv[i];
+        auto valeurSuivante = [&]() -> std::string {
+            if (i + 1 >= argc) throw std::invalid_argument("Valeur manquante apres " + argument);
+            if (std::string(argv[i + 1]).rfind("--", 0) == 0)
+                throw std::invalid_argument("Valeur manquante apres " + argument);
+            return argv[++i];
+        };
+        if (argument == "--sans-affichage") {
+            options.affichage = false;
+        } else if (argument == "--normalisation") {
+            const std::string valeur = valeurSuivante();
+            if (valeur == "manuel") options.mode = ModeNormalisation::Manuel;
+            else if (valeur == "opencv") options.mode = ModeNormalisation::OpenCV;
+            else if (valeur == "aucune") options.mode = ModeNormalisation::Aucune;
+            else throw std::invalid_argument("Mode inconnu : " + valeur);
+        } else if (argument == "--max-images") {
+            const std::string valeur = valeurSuivante();
+            std::size_t position = 0;
+            const long long nombre = std::stoll(valeur, &position);
+            if (position != valeur.size() || nombre <= 0 || nombre > std::numeric_limits<int>::max())
+                throw std::invalid_argument("--max-images attend un entier strictement positif");
+            options.maximum_images = static_cast<int>(nombre);
+        } else if (argument == "--sortie") {
+            options.sortie = valeurSuivante();
+            if (options.sortie.empty()) throw std::invalid_argument("Le dossier de sortie est vide");
+        } else if (argument.rfind("--", 0) == 0) {
+            throw std::invalid_argument("Option inconnue : " + argument);
+        } else {
+            if (video_fournie) throw std::invalid_argument("Une seule video doit etre fournie");
+            options.video = argument;
+            video_fournie = true;
+        }
+    }
+    return options;
+}
+
+void appliquerNormalisation(cv::Mat& luminosite, ModeNormalisation mode)
+{
+    // Un seul traitement est applique : on ne cumule pas les variantes.
+    if (mode == ModeNormalisation::Manuel) normaliserMinMax(luminosite);
+    else if (mode == ModeNormalisation::OpenCV)
+        cv::normalize(luminosite, luminosite, 0, 255, cv::NORM_MINMAX);
+    // Le mode aucune conserve la luminosite originale pour une comparaison future.
+}
+
+void enregistrerImage(const std::filesystem::path& chemin, const cv::Mat& image)
+{
+    if (!cv::imwrite(chemin.string(), image))
+        throw std::runtime_error("Impossible d'enregistrer " + chemin.string());
+}
+} // namespace
+
+int executerProgramme(const Options& options)
+{
+    const std::string& chemin_video = options.video;
     cv::VideoCapture capture(chemin_video);
 
     if (capture.isOpened() == false) {
@@ -91,6 +111,12 @@ int main(int argc, char* argv[])
 
     const int largeur = static_cast<int>(capture.get(cv::CAP_PROP_FRAME_WIDTH));
     const int hauteur = static_cast<int>(capture.get(cv::CAP_PROP_FRAME_HEIGHT));
+
+    if (largeur <= 0 || hauteur <= 0) {
+        std::cerr << "Erreur : dimensions video invalides." << std::endl;
+        return 1;
+    }
+    std::cout << "Normalisation de la boucle video : " << nomMode(options.mode) << std::endl;
 
     // Parametres de seuillage HSV de la pelouse
     const cv::Scalar vert_min(38, 35, 25);
@@ -113,6 +139,9 @@ int main(int argc, char* argv[])
 
     std::vector<cv::Mat> canaux_init;
     cv::split(hsv_init, canaux_init);
+    // Reference historique : le contour fixe du terrain utilise toujours cette
+    // normalisation manuelle. Les modes de la boucle sont ainsi compares dans
+    // la meme zone de terrain, sans modifier deux parametres en meme temps.
     normaliserMinMax(canaux_init[2]);
     cv::merge(canaux_init, hsv_init);
 
@@ -189,12 +218,24 @@ int main(int argc, char* argv[])
 
     // Configuration des fenetres d affichage
     const std::string fenetre_focus = "Multipistage - Focus Terrain (Decor 60% couleur)";
-    cv::namedWindow(fenetre_focus, cv::WINDOW_NORMAL);
-    cv::resizeWindow(fenetre_focus, taille_affichage.width, taille_affichage.height);
+
 
     const std::string fenetre_masque = "Multipistage - Masque Pelouse (Decor estompe 60%)";
-    cv::namedWindow(fenetre_masque, cv::WINDOW_NORMAL);
-    cv::resizeWindow(fenetre_masque, taille_affichage.width, taille_affichage.height);
+    if (options.affichage) {
+        cv::namedWindow(fenetre_focus, cv::WINDOW_NORMAL);
+        cv::resizeWindow(fenetre_focus, taille_affichage.width, taille_affichage.height);
+        cv::namedWindow(fenetre_masque, cv::WINDOW_NORMAL);
+        cv::resizeWindow(fenetre_masque, taille_affichage.width, taille_affichage.height);
+    }
+
+    std::ofstream mesures;
+    if (!options.sortie.empty()) {
+        std::filesystem::create_directories(options.sortie);
+        mesures.open(options.sortie / "mesures_application.csv");
+        if (!mesures) throw std::runtime_error("Impossible d'ouvrir le CSV de mesures");
+        mesures << "frame,mode,width,height,normalisation_ms,pelouse_pixels_image_entiere\n";
+        enregistrerImage(options.sortie / "terrain_initial.png", masque_terrain);
+    }
 
     // Matrices memoires reutilisees dans la boucle de traitement
     cv::Mat frame, hsv, masque_pelouse;
@@ -206,7 +247,9 @@ int main(int argc, char* argv[])
     int64 debut_mesure = debut_lecture;
     double echeance_image_ms = periode_image_ms;
     int images_mesure = 0;
-    while (true) {
+    int images_traitees = 0;
+    double total_normalisation_ms = 0.0;
+    while (options.maximum_images == 0 || images_traitees < options.maximum_images) {
         if (capture.read(frame) == false || frame.empty() == true) {
             std::cout << "Fin de la video atteinte." << std::endl;
             break;
@@ -215,7 +258,14 @@ int main(int argc, char* argv[])
         // Conversion en HSV et normalisation de la luminosite sur le canal V
         cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
         cv::extractChannel(hsv, luminosite, 2);
-        cv::normalize(luminosite, luminosite, 0, 255, cv::NORM_MINMAX);
+        // Etape D : la fonction manuelle est maintenant appliquee a chaque image.
+        // Le mode opencv conserve une reference accessible sans modifier le code.
+        // Le chronometre exclut lecture video, conversion HSV et affichage.
+        const int64 debut_normalisation = cv::getTickCount();
+        appliquerNormalisation(luminosite, options.mode);
+        const double normalisation_ms = (cv::getTickCount() - debut_normalisation)
+                                      * 1000.0 / frequence_horloge;
+        total_normalisation_ms += normalisation_ms;
 
         // Seuillage binaire de la pelouse verte
         cv::inRange(hsv, couleur_min, couleur_max, masque_pelouse);
@@ -241,19 +291,40 @@ int main(int argc, char* argv[])
         gray_frame.convertTo(decor_estompe_gray, -1, 0.60);
         decor_estompe_gray.copyTo(masque_affiche, decor_affiche);
 
-        // Affichage synchronise des deux fenetres
-        cv::imshow(fenetre_focus, rendu_visuel);
-        cv::imshow(fenetre_masque, masque_affiche);
+        if (mesures.is_open()) {
+            mesures << images_traitees << ',' << nomMode(options.mode) << ','
+                    << largeur << ',' << hauteur << ',' << normalisation_ms << ','
+                    << cv::countNonZero(masque_pelouse) << '\n';
+        }
+        // Captures avant/apres sur les memes indices ; le masque brut reste
+        // separe de son rendu, qui contient aussi du decor gris pour l'affichage.
+        const bool capturer = images_traitees == 0 || (options.maximum_images > 0 &&
+            (images_traitees == options.maximum_images / 2 ||
+             images_traitees == options.maximum_images - 1));
+        if (!options.sortie.empty() && capturer) {
+            const std::string suffixe = std::to_string(images_traitees) + ".png";
+            enregistrerImage(options.sortie / ("mask_" + suffixe), masque_affiche);
+            enregistrerImage(options.sortie / ("color_" + suffixe), rendu_visuel);
+            enregistrerImage(options.sortie / ("masque_brut_" + suffixe), masque_pelouse);
+        }
+        ++images_traitees;
 
-        // Une echeance commune compense aussi les depassements du delai Windows.
-        const double temps_lecture_ms = (cv::getTickCount() - debut_lecture) * 1000.0 / frequence_horloge;
-        const double attente_ms = echeance_image_ms - temps_lecture_ms;
-        const int touche = attente_ms > 0
-            ? cv::waitKey(std::max(1, static_cast<int>(std::ceil(attente_ms))))
-            : cv::pollKey();
-        if (touche == 'q' || touche == 'Q' || touche == 27) {
-            std::cout << "Lecture arretee par l'utilisateur." << std::endl;
-            break;
+        if (options.affichage) {
+            cv::imshow(fenetre_focus, rendu_visuel);
+            cv::imshow(fenetre_masque, masque_affiche);
+
+            // La synchronisation sert seulement a la lecture avec fenetres.
+            // Les tests sans affichage ne dorment pas entre les images.
+            const double temps_lecture_ms = (cv::getTickCount() - debut_lecture)
+                                           * 1000.0 / frequence_horloge;
+            const double attente_ms = echeance_image_ms - temps_lecture_ms;
+            const int touche = attente_ms > 0
+                ? cv::waitKey(std::max(1, static_cast<int>(std::ceil(attente_ms))))
+                : cv::pollKey();
+            if (touche == 'q' || touche == 'Q' || touche == 27) {
+                std::cout << "Lecture arretee par l'utilisateur." << std::endl;
+                break;
+            }
         }
 
         ++images_mesure;
@@ -273,7 +344,35 @@ int main(int argc, char* argv[])
     }
 
     capture.release();
-    cv::destroyAllWindows();
+    if (options.affichage) cv::destroyAllWindows();
+    if (mesures.is_open()) {
+        mesures.flush();
+        if (!mesures) throw std::runtime_error("Echec d'ecriture du CSV de mesures");
+    }
+    std::cout << "BILAN images=" << images_traitees << " mode=" << nomMode(options.mode)
+              << " normalisation_moyenne_ms="
+              << (images_traitees > 0 ? total_normalisation_ms / images_traitees : 0.0)
+              << std::endl;
+    if (options.maximum_images > 0 && images_traitees < options.maximum_images) {
+        std::cerr << "Video trop courte pour le nombre d'images demande." << std::endl;
+        return 2;
+    }
+    return images_traitees > 0 ? 0 : 1;
+}
 
-    return 0;
+int main(int argc, char* argv[])
+{
+    try {
+        // --help est gere avant toute ouverture de video ou creation de dossier.
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
+                afficherAide();
+                return 0;
+            }
+        }
+        return executerProgramme(lireOptions(argc, argv));
+    } catch (const std::exception& erreur) {
+        std::cerr << "Erreur : " << erreur.what() << std::endl;
+        return 1;
+    }
 }
