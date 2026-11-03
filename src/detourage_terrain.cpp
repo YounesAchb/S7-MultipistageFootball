@@ -7,7 +7,7 @@
 
 int main()
 {
-    const std::string chemin_video = "../data/videos/clip1.mp4";
+    const std::string chemin_video = "../data/videos/clip3.mp4";
     cv::VideoCapture capture(chemin_video);
 
     if (capture.isOpened() == false) {

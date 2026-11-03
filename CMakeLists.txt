@@ -26,4 +26,6 @@ target_link_libraries(initiation_opencv ${OpenCV_LIBS})
 add_executable(detourage_terrain src/detourage_terrain.cpp)
 target_link_libraries(detourage_terrain ${OpenCV_LIBS})
 
-
+# 4. Programme de detection des pieds des joueurs : detection_pieds
+add_executable(detection_pieds src/detection_pieds.cpp)
+target_link_libraries(detection_pieds ${OpenCV_LIBS})
