@@ -19,3 +19,7 @@ edgetrack-foot
 *.mkv
 videos/
 data/videos/
+*.csv
+*.py
+*.pdf
+*.docx

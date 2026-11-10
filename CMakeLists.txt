@@ -14,18 +14,23 @@ find_package(OpenCV REQUIRED)
 
 include_directories(${OpenCV_INCLUDE_DIRS})
 
-# 1. Programme principal : multipistage (où nous travaillons sur le masque)
-add_executable(multipistage src/main.cpp)
+# --- Cibles Vue Panoramique (conservées) ---
+add_executable(multipistage src/vue_panoramique/main.cpp)
 target_link_libraries(multipistage ${OpenCV_LIBS})
 
-# 2. premier programme de test conservé : initiation_opencv
-add_executable(initiation_opencv src/initiation_opencv.cpp)
+add_executable(initiation_opencv src/vue_panoramique/initiation_opencv.cpp)
 target_link_libraries(initiation_opencv ${OpenCV_LIBS})
 
-# 3. Programme de détourage automatique du terrain panoramique : detourage_terrain
-add_executable(detourage_terrain src/detourage_terrain.cpp)
+add_executable(detourage_terrain src/vue_panoramique/detourage_terrain.cpp)
 target_link_libraries(detourage_terrain ${OpenCV_LIBS})
 
-# 4. Programme de detection des pieds des joueurs : detection_pieds
-add_executable(detection_pieds src/detection_pieds.cpp)
+add_executable(detection_pieds src/vue_panoramique/detection_pieds.cpp)
 target_link_libraries(detection_pieds ${OpenCV_LIBS})
+
+add_executable(suivi_reidentification src/vue_panoramique/suivi_reidentification.cpp)
+target_link_libraries(suivi_reidentification ${OpenCV_LIBS})
+
+# --- Cibles Vue de Haut / Zénithale ---
+# 6. Programme de tracking universel vue du dessus : tracking_vue_haut
+add_executable(tracking_vue_haut src/vue_haut/tracking_vue_haut.cpp)
+target_link_libraries(tracking_vue_haut ${OpenCV_LIBS})
