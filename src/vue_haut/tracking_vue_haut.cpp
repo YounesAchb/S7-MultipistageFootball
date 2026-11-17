@@ -187,15 +187,20 @@ int main(int argc, char* argv[]) {
 
     // Cadence native de la vidéo pour asservir la vitesse d'affichage en temps réel (1.0x)
     double fps = cap.get(cv::CAP_PROP_FPS);
-    if (fps <= 0.0 || std::isnan(fps)) fps = 30.0;
-    double delai_nominal_ms = 1000.0 / fps; // ~33.36 ms pour 29.97 FPS
+    // Sécurité cross-platform : sous Windows/Linux, OpenCV renvoie parfois 1000 ou 0
+    if (fps <= 5.0 || fps > 120.0 || std::isnan(fps)) {
+        fps = 30.0;
+    }
+    double delai_nominal_ms = 1000.0 / fps; // ~33.36 ms pour 30 FPS
+    std::cout << "[INFO] Cadence video regulee : " << fps << " FPS (" 
+              << static_cast<int>(delai_nominal_ms) << " ms/trame)" << std::endl;
 
     cv::Mat frame, zone_terrain, non_pelouse, rendu;
 
     // 2. Boucle de suivi vidéo temps réel
-    while (cap.read(frame)) {
-        if (frame.empty()) break;
+    while (true) {
         int64_t t_debut = cv::getTickCount();
+        if (!cap.read(frame) || frame.empty()) break;
         num_trame++;
 
         zone_terrain = frame(terrain);
