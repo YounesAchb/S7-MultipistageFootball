@@ -7,13 +7,42 @@
 #if __has_include(<opencv2/geometry.hpp>)
 #include <opencv2/geometry.hpp>
 #endif
+#include "algorithme_hongrois.hpp"
 
 // Structure représentant un joueur suivi en vue de dessus
 struct JoueurTracke {
     int id;
-    cv::Rect boite;   // Boîte englobante en coordonnées vidéo 4K
-    cv::Point corps;  // Centre du corps entier
+    cv::Rect boite;                // Boîte englobante en coordonnées vidéo 4K
+    cv::Point2f corps;             // Centre estimé du corps
+    cv::Point2f vitesse{0.f, 0.f}; // Vitesse estimée (modèle cinétique / filtre alpha-beta)
+    cv::Vec3f couleur{0.f, 0.f, 0.f}; // Signature chromatique moyenne (B, G, R) pour Re-ID
+    int frames_sans_mesure = 0;    // Trames consécutives sans détection candidate directe
 };
+
+// Extraction de la signature couleur (B, G, R) moyenne sur les pixels non-pelouse du candidat (100% FPGA streamable)
+inline cv::Vec3f extraireCouleurCandidat(const cv::Mat& zone_bgr, const cv::Mat& non_pel, const cv::Rect& b) {
+    int x0 = std::max(0, b.x);
+    int y0 = std::max(0, b.y);
+    int x1 = std::min(zone_bgr.cols, b.x + b.width);
+    int y1 = std::min(zone_bgr.rows, b.y + b.height);
+
+    float sb = 0.f, sg = 0.f, sr = 0.f;
+    int n = 0;
+    for (int y = y0; y < y1; ++y) {
+        const uchar* m = non_pel.ptr<uchar>(y);
+        const cv::Vec3b* rgb = zone_bgr.ptr<cv::Vec3b>(y);
+        for (int x = x0; x < x1; ++x) {
+            if (m[x] > 0) {
+                sb += rgb[x][0];
+                sg += rgb[x][1];
+                sr += rgb[x][2];
+                n++;
+            }
+        }
+    }
+    if (n < 10) return cv::Vec3f(128.f, 128.f, 128.f);
+    return cv::Vec3f(sb / n, sg / n, sr / n);
+}
 
 // État de la sélection interactive par clic de souris
 struct GestionSouris {
@@ -125,13 +154,12 @@ int main(int argc, char* argv[]) {
     fichier_coords << "trame,id,x,y\n";
 
     const int MARGE = 35;
-    cv::TermCriteria critere(cv::TermCriteria::EPS | cv::TermCriteria::COUNT, 10, 1);
     std::vector<JoueurTracke> joueurs;
     int prochain_id = 1;
     int num_trame = 0;
 
     GestionSouris souris;
-    const std::string nom_fenetre = "Tracking CamShift Vue de Haut";
+    const std::string nom_fenetre = "Tracking Vue de Haut - Multi-Joueurs";
     cv::namedWindow(nom_fenetre, cv::WINDOW_NORMAL);
     cv::resizeWindow(nom_fenetre, 1280, 720);
     cv::setMouseCallback(nom_fenetre, onMouse, &souris);
@@ -160,61 +188,215 @@ int main(int argc, char* argv[]) {
         non_pelouse(cv::Rect(0, 0, MARGE, zone_terrain.rows)).setTo(0);
         non_pelouse(cv::Rect(zone_terrain.cols - MARGE, 0, MARGE, zone_terrain.rows)).setTo(0);
 
-        // Détection des candidats joueurs et effacement des lignes de jeu
+        // Détection des candidats joueurs compacts (sans effacement destructeur des lignes)
         std::vector<std::vector<cv::Point>> contours;
         cv::findContours(non_pelouse, contours, cv::RETR_LIST, cv::CHAIN_APPROX_SIMPLE);
 
-        std::vector<cv::Point> candidats;
+        std::vector<cv::Point> candidats_bruts;
+        std::vector<cv::Rect> boites_brutes;
         for (size_t i = 0; i < contours.size(); ++i) {
             cv::Rect b = cv::boundingRect(contours[i]);
             double a = cv::contourArea(contours[i]);
-            if (b.width > 45 || b.height > 45) {
-                cv::drawContours(non_pelouse, contours, static_cast<int>(i), cv::Scalar(0), 12);
-            } else if (b.width >= 12 && b.width <= 45 && b.height >= 12 && b.height <= 45 && a >= 80.0) {
-                candidats.push_back(cv::Point(b.x + b.width / 2, b.y + b.height / 2));
+            // On retient les formes compactes : joueurs isolés (12-45 px) ou duels au coude-à-coude (jusqu'à 75 px)
+            // Les lignes droites sont rejetées par le ratio d'aspect (> 2.5)
+            // Les lignes courbes creuses (arcs du rond central, surfaces) sont rejetées par la densité (< 0.22)
+            // Les joueurs réels ont une silhouette pleine (densité >= 0.25, moyenne ~0.51)
+            bool est_compact = (b.width < 2.5 * b.height) && (b.height < 2.5 * b.width);
+            double densite = a / (static_cast<double>(b.width) * b.height);
+            if (b.width >= 12 && b.width <= 75 && b.height >= 12 && b.height <= 75 && a >= 80.0 && est_compact && densite >= 0.22) {
+                candidats_bruts.push_back(cv::Point(b.x + b.width / 2, b.y + b.height / 2));
+                boites_brutes.push_back(b);
             }
         }
 
-        // Suivi CamShift pour chaque joueur
-        for (size_t i = 0; i < joueurs.size(); ++i) {
-            cv::Rect b_loc(joueurs[i].boite.x - terrain.x, joueurs[i].boite.y - terrain.y,
-                           joueurs[i].boite.width, joueurs[i].boite.height);
-            b_loc = b_loc & cv::Rect(0, 0, zone_terrain.cols, zone_terrain.rows);
-            if (b_loc.area() <= 0) continue;
-
-            cv::RotatedRect rot = cv::CamShift(non_pelouse, b_loc, critere);
-            b_loc = rot.boundingRect();
-            b_loc.width = std::max(16, std::min(32, b_loc.width));
-            b_loc.height = std::max(16, std::min(32, b_loc.height));
-
-            joueurs[i].boite = cv::Rect(b_loc.x + terrain.x, b_loc.y + terrain.y, b_loc.width, b_loc.height);
-            joueurs[i].corps = cv::Point(joueurs[i].boite.x + joueurs[i].boite.width / 2,
-                                        joueurs[i].boite.y + joueurs[i].boite.height / 2);
-        }
-
-        // Gestion des collisions (dédoublonnage in-place)
-        for (size_t i = 0; i < joueurs.size(); ++i) {
-            for (size_t j = i + 1; j < joueurs.size(); ) {
-                if (std::abs(joueurs[i].corps.x - joueurs[j].corps.x) < 18 &&
-                    std::abs(joueurs[i].corps.y - joueurs[j].corps.y) < 18) {
-                    if (joueurs[j].id == souris.id_selectionne) souris.id_selectionne = joueurs[i].id;
-                    joueurs.erase(joueurs.begin() + j);
-                } else ++j;
-            }
-        }
-
-        // Ajout initial et ré-acquisition des joueurs
-        for (size_t i = 0; i < candidats.size(); ++i) {
-            int gx = candidats[i].x + terrain.x, gy = candidats[i].y + terrain.y;
-            bool deja_suivi = false;
-            for (size_t k = 0; k < joueurs.size(); ++k) {
-                if (std::abs(gx - joueurs[k].corps.x) < 25 && std::abs(gy - joueurs[k].corps.y) < 25) {
-                    deja_suivi = true; break;
+        // Élimination des détections multiples sur le même corps (< 15 px) et extraction des couleurs
+        std::vector<cv::Point> candidats;
+        std::vector<cv::Vec3f> couleurs_candidats;
+        for (size_t i = 0; i < candidats_bruts.size(); ++i) {
+            bool doublon = false;
+            for (size_t k = 0; k < candidats.size(); ++k) {
+                if (std::hypot(candidats_bruts[i].x - candidats[k].x, candidats_bruts[i].y - candidats[k].y) < 15.0) {
+                    doublon = true; break;
                 }
             }
-            if (!deja_suivi) {
-                JoueurTracke j = {prochain_id++, cv::Rect(gx - 12, gy - 12, 24, 24), cv::Point(gx, gy)};
-                joueurs.push_back(j);
+            if (!doublon) {
+                candidats.push_back(candidats_bruts[i]);
+                couleurs_candidats.push_back(extraireCouleurCandidat(zone_terrain, non_pelouse, boites_brutes[i]));
+            }
+        }
+
+        // 1. Initialisation sur la première trame
+        if (joueurs.empty()) {
+            for (size_t j = 0; j < candidats.size(); ++j) {
+                float gx = static_cast<float>(candidats[j].x + terrain.x);
+                float gy = static_cast<float>(candidats[j].y + terrain.y);
+                JoueurTracke nouv;
+                nouv.id = prochain_id++;
+                nouv.boite = cv::Rect(static_cast<int>(gx - 12), static_cast<int>(gy - 12), 24, 24);
+                nouv.corps = cv::Point2f(gx, gy);
+                nouv.vitesse = cv::Point2f(0.f, 0.f);
+                nouv.couleur = couleurs_candidats[j];
+                nouv.frames_sans_mesure = 0;
+                joueurs.push_back(nouv);
+            }
+        } else {
+            // 2. Modèle cinétique à vitesse constante (Kalman 1D / filtre alpha-beta)
+            std::vector<cv::Point2f> pos_predites(joueurs.size());
+            for (size_t i = 0; i < joueurs.size(); ++i) {
+                if (joueurs[i].frames_sans_mesure > 0) {
+                    joueurs[i].vitesse *= 0.85f; // Amortissement en cas de perte de mesure
+                }
+                pos_predites[i] = joueurs[i].corps + joueurs[i].vitesse;
+            }
+
+            // 3. Association optimale par l'Algorithme Hongrois spatio-chromatique (Re-ID couleur)
+            std::vector<int> assignations;
+            if (!candidats.empty()) {
+                std::vector<std::vector<float>> couts(joueurs.size(), std::vector<float>(candidats.size()));
+                for (size_t i = 0; i < joueurs.size(); ++i) {
+                    for (size_t j = 0; j < candidats.size(); ++j) {
+                        float gx = static_cast<float>(candidats[j].x + terrain.x);
+                        float gy = static_cast<float>(candidats[j].y + terrain.y);
+                        float d_spatial = static_cast<float>(std::hypot(pos_predites[i].x - gx, pos_predites[i].y - gy));
+
+                        // Distance chromatique euclidienne RGB
+                        cv::Vec3f dc = joueurs[i].couleur - couleurs_candidats[j];
+                        float d_couleur = std::sqrt(dc[0]*dc[0] + dc[1]*dc[1] + dc[2]*dc[2]);
+
+                        // Coût combiné : la distance spatiale guide le suivi, la couleur arbitre infailliblement les collisions
+                        couts[i][j] = d_spatial + 0.6f * d_couleur;
+                    }
+                }
+                // Gating à 75 (autorise jusqu'à 45 px spatial + composante couleur)
+                assignations = tracking::resoudreHongrois(couts, 75.0f);
+            } else {
+                assignations.assign(joueurs.size(), -1);
+            }
+
+            std::vector<bool> candidat_utilise(candidats.size(), false);
+
+            // 4. Mise à jour des pistes
+            for (size_t i = 0; i < joueurs.size(); ++i) {
+                int c_idx = assignations[i];
+                if (c_idx != -1) {
+                    candidat_utilise[c_idx] = true;
+                    float gx = static_cast<float>(candidats[c_idx].x + terrain.x);
+                    float gy = static_cast<float>(candidats[c_idx].y + terrain.y);
+
+                    cv::Point2f v_inst(gx - joueurs[i].corps.x, gy - joueurs[i].corps.y);
+                    if (std::hypot(v_inst.x, v_inst.y) < 25.0f) {
+                        joueurs[i].vitesse = 0.5f * joueurs[i].vitesse + 0.5f * v_inst;
+                    }
+
+                    // Lissage temporel de la couleur (90% inertie, 10% nouvelle mesure)
+                    joueurs[i].couleur = 0.90f * joueurs[i].couleur + 0.10f * couleurs_candidats[c_idx];
+
+                    joueurs[i].corps = cv::Point2f(gx, gy);
+                    joueurs[i].boite.x = static_cast<int>(gx - 12);
+                    joueurs[i].boite.y = static_cast<int>(gy - 12);
+                    joueurs[i].frames_sans_mesure = 0;
+                } else {
+                    // Le joueur n'a pas été associé par l'analyse globale des contours
+                    // VÉRIFICATION LOCALE SUR LES LIGNES BLANCHES :
+                    // Lorsqu'un joueur marche sur une ligne de jeu (médiane, rond central, surface),
+                    // sa silhouette est fusionnée avec la ligne et le contour géant est rejeté.
+                    // Cependant, ses 300+ pixels de corps sont bien présents dans non_pelouse !
+                    int lx = static_cast<int>(pos_predites[i].x - terrain.x);
+                    int ly = static_cast<int>(pos_predites[i].y - terrain.y);
+                    int x0 = std::max(0, lx - 14), x1 = std::min(zone_terrain.cols, lx + 14);
+                    int y0 = std::max(0, ly - 14), y1 = std::min(zone_terrain.rows, ly + 14);
+
+                    float sum_x = 0.f, sum_y = 0.f;
+                    int n_pix = 0;
+                    for (int py = y0; py < y1; ++py) {
+                        const uchar* m = non_pelouse.ptr<uchar>(py);
+                        for (int px = x0; px < x1; ++px) {
+                            if (m[px] > 0) {
+                                sum_x += px;
+                                sum_y += py;
+                                n_pix++;
+                            }
+                        }
+                    }
+
+                    // Si au moins 90 pixels de corps sont présents : le joueur est sur la ligne !
+                    if (n_pix >= 90) {
+                        float bx = sum_x / n_pix + terrain.x;
+                        float by = sum_y / n_pix + terrain.y;
+                        if (std::hypot(bx - pos_predites[i].x, by - pos_predites[i].y) < 18.0f) {
+                            cv::Point2f v_inst(bx - joueurs[i].corps.x, by - joueurs[i].corps.y);
+                            if (std::hypot(v_inst.x, v_inst.y) < 20.0f) {
+                                joueurs[i].vitesse = 0.6f * joueurs[i].vitesse + 0.4f * v_inst;
+                            }
+                            joueurs[i].corps = cv::Point2f(bx, by);
+                            joueurs[i].boite.x = static_cast<int>(bx - 12);
+                            joueurs[i].boite.y = static_cast<int>(by - 12);
+                            joueurs[i].frames_sans_mesure = 0; // Piste verrouillée sur la ligne : zéro lag, zéro perte d'ID !
+                            continue;
+                        }
+                    }
+
+                    // Vrai masquage temporaire (duel complet) : maintien cinétique inertiel
+                    joueurs[i].frames_sans_mesure++;
+                    joueurs[i].corps = pos_predites[i];
+                    joueurs[i].boite.x = static_cast<int>(joueurs[i].corps.x - 12);
+                    joueurs[i].boite.y = static_cast<int>(joueurs[i].corps.y - 12);
+                }
+            }
+
+            // 5. Cohésion de duel : lorsqu'un joueur non-mesuré est au contact (< 35 px) d'un joueur mesuré,
+            // il accompagne le centre du duel pour préserver son identité jusqu'à la séparation
+            for (size_t i = 0; i < joueurs.size(); ++i) {
+                if (joueurs[i].frames_sans_mesure > 0) {
+                    for (size_t k = 0; k < joueurs.size(); ++k) {
+                        if (k != i && joueurs[k].frames_sans_mesure == 0) {
+                            float d = static_cast<float>(std::hypot(joueurs[i].corps.x - joueurs[k].corps.x,
+                                                                    joueurs[i].corps.y - joueurs[k].corps.y));
+                            if (d < 35.0f) {
+                                joueurs[i].vitesse = joueurs[k].vitesse;
+                                joueurs[i].corps = joueurs[k].corps;
+                                joueurs[i].boite.x = static_cast<int>(joueurs[i].corps.x - 12);
+                                joueurs[i].boite.y = static_cast<int>(joueurs[i].corps.y - 12);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 6. Ré-acquisition uniquement si l'effectif actuel est incomplet (< 24 personnes max)
+            // et si le candidat n'est pas déjà couvert par un joueur existant (>= 35 px)
+            for (size_t j = 0; j < candidats.size(); ++j) {
+                if (!candidat_utilise[j] && joueurs.size() < 24) {
+                    float gx = static_cast<float>(candidats[j].x + terrain.x);
+                    float gy = static_cast<float>(candidats[j].y + terrain.y);
+                    bool deja_suivi = false;
+                    for (size_t k = 0; k < joueurs.size(); ++k) {
+                        if (std::hypot(gx - joueurs[k].corps.x, gy - joueurs[k].corps.y) < 35.0f) {
+                            deja_suivi = true; break;
+                        }
+                    }
+                    if (!deja_suivi) {
+                        JoueurTracke nouv;
+                        nouv.id = prochain_id++;
+                        nouv.boite = cv::Rect(static_cast<int>(gx - 12), static_cast<int>(gy - 12), 24, 24);
+                        nouv.corps = cv::Point2f(gx, gy);
+                        nouv.vitesse = cv::Point2f(0.f, 0.f);
+                        nouv.couleur = couleurs_candidats[j];
+                        nouv.frames_sans_mesure = 0;
+                        joueurs.push_back(nouv);
+                    }
+                }
+            }
+        }
+
+        // 7. Nettoyage des pistes perdues après disparition prolongée (> 90 trames = 1.5 s)
+        for (size_t i = 0; i < joueurs.size(); ) {
+            if (joueurs[i].frames_sans_mesure > 90) {
+                if (joueurs[i].id == souris.id_selectionne) souris.id_selectionne = -1;
+                joueurs.erase(joueurs.begin() + i);
+            } else {
+                ++i;
             }
         }
 
@@ -238,11 +420,23 @@ int main(int argc, char* argv[]) {
             bool sel = (joueurs[i].id == souris.id_selectionne);
             cv::Scalar col = sel ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 255, 255);
             cv::rectangle(frame, joueurs[i].boite, col, sel ? 3 : 2);
-            cv::circle(frame, joueurs[i].corps, 3, cv::Scalar(0, 0, 255), -1);
+            cv::circle(frame, cv::Point(static_cast<int>(joueurs[i].corps.x), static_cast<int>(joueurs[i].corps.y)), 3, cv::Scalar(0, 0, 255), -1);
+
+            // En cas de duel serré (< 15 px), décaler le texte du joueur masqué vers le bas pour une lisibilité parfaite
+            bool duel_serre = false;
+            for (size_t k = 0; k < joueurs.size(); ++k) {
+                if (k != i && std::hypot(joueurs[i].corps.x - joueurs[k].corps.x, joueurs[i].corps.y - joueurs[k].corps.y) < 15.0f) {
+                    duel_serre = true; break;
+                }
+            }
+            int y_txt = (duel_serre && joueurs[i].frames_sans_mesure > 0)
+                        ? (joueurs[i].boite.y + joueurs[i].boite.height + 16)
+                        : (joueurs[i].boite.y - 6);
+
             cv::putText(frame, std::to_string(joueurs[i].id),
-                        cv::Point(joueurs[i].boite.x, joueurs[i].boite.y - 6),
+                        cv::Point(joueurs[i].boite.x, y_txt),
                         cv::FONT_HERSHEY_SIMPLEX, 0.7, col, 2);
-            if (sel) cv::circle(frame, joueurs[i].corps, 22, cv::Scalar(0, 255, 0), 2);
+            if (sel) cv::circle(frame, cv::Point(static_cast<int>(joueurs[i].corps.x), static_cast<int>(joueurs[i].corps.y)), 22, cv::Scalar(0, 255, 0), 2);
         }
 
         // Tracé précis du quadrilatère de jeu suivant exactement l'inclinaison des 4 corners

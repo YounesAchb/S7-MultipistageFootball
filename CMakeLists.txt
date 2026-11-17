@@ -12,7 +12,7 @@ endif()
 # Recherche automatique d'OpenCV (fonctionne sur Mac, Windows et Linux)
 find_package(OpenCV REQUIRED)
 
-include_directories(${OpenCV_INCLUDE_DIRS})
+include_directories(${OpenCV_INCLUDE_DIRS} include)
 
 # --- Cibles Vue Panoramique (conservées) ---
 add_executable(multipistage src/vue_panoramique/main.cpp)
