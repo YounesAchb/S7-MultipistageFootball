@@ -34,3 +34,7 @@ target_link_libraries(suivi_reidentification ${OpenCV_LIBS})
 # 6. Programme de tracking universel vue du dessus : tracking_vue_haut
 add_executable(tracking_vue_haut src/vue_haut/tracking_vue_haut.cpp)
 target_link_libraries(tracking_vue_haut ${OpenCV_LIBS})
+
+# 7. Programme de test et simulation de l'IP de normalisation d'image FPGA : test_normalisation_fpga
+add_executable(test_normalisation_fpga src/fpga/test_normalisation_fpga.cpp)
+target_link_libraries(test_normalisation_fpga ${OpenCV_LIBS})
