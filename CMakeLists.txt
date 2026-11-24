@@ -84,3 +84,10 @@ add_executable(tracking_homographie_vitesse
 target_link_libraries(tracking_homographie_vitesse PRIVATE
     ${OpenCV_LIBS}
 )
+
+
+add_executable(tracking_homographie_equipes
+    src/vue_haut/tracking_homographie_equipes.cpp
+)
+
+target_link_libraries(tracking_homographie_equipes PRIVATE ${OpenCV_LIBS})
