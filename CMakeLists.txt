@@ -66,3 +66,21 @@ add_executable(verification_keypoints
     src/verification_keypoints.cpp
 )
 target_link_libraries(verification_keypoints PRIVATE ${OpenCV_LIBS})
+
+
+# Tracking avec projection homographique
+add_executable(tracking_homographie
+    src/vue_haut/tracking_homographie.cpp
+)
+
+target_link_libraries(tracking_homographie PRIVATE ${OpenCV_LIBS})
+
+
+# Tracking avec homographie et calcul des vitesses
+add_executable(tracking_homographie_vitesse
+    src/vue_haut/tracking_homographie_vitesse.cpp
+)
+
+target_link_libraries(tracking_homographie_vitesse PRIVATE
+    ${OpenCV_LIBS}
+)
