@@ -38,3 +38,7 @@ target_link_libraries(tracking_vue_haut ${OpenCV_LIBS})
 # 7. Programme de test et simulation de l'IP de normalisation d'image FPGA : test_normalisation_fpga
 add_executable(test_normalisation_fpga src/fpga/test_normalisation_fpga.cpp)
 target_link_libraries(test_normalisation_fpga ${OpenCV_LIBS})
+
+# 8. Test logiciel de la normalisation d'histogramme (gris avant / apres) : test_normalisation_soft
+add_executable(test_normalisation_soft src/vue_haut/test_normalisation_soft.cpp)
+target_link_libraries(test_normalisation_soft ${OpenCV_LIBS})

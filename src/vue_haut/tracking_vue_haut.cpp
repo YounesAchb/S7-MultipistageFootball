@@ -15,6 +15,7 @@ struct JoueurTracke {
     cv::Point2f vitesse;           // Vitesse estimée (dx, dy en pixels/trame)
     cv::Vec3f couleur;             // Signature chromatique moyenne (B, G, R)
     int frames_sans_mesure;        // Nombre de trames consécutives sans détection directe
+    int frames_confirmation;       // Associations directes depuis la création (piste confirmée à 30)
 };
 
 // Met à jour la position et la boîte 24x24 d'un joueur
@@ -34,6 +35,7 @@ JoueurTracke creerNouveauJoueur(int id, float x, float y, const cv::Vec3f& coule
     j.vitesse = cv::Point2f(0.0f, 0.0f);
     j.couleur = couleur;
     j.frames_sans_mesure = 0;
+    j.frames_confirmation = 0;
     deplacerJoueur(j, x, y);
     return j;
 }
@@ -63,6 +65,84 @@ cv::Vec3f extraireCouleurCandidat(const cv::Mat& zone_bgr, const cv::Mat& masque
     return cv::Vec3f(somme_b / nb_pixels, somme_g / nb_pixels, somme_r / nb_pixels);
 }
 
+// =========================================================================================
+// NORMALISATION D'IMAGE (étirement de dynamique) — partie ARM + partie FPGA
+//   ARM  : sur le terrain (1 ligne / 8, 1 colonne / 8), Nmin = 1 % du plus petit canal
+//          min(B,G,R), Nmax = 99 % du plus grand canal max(B,G,R), puis LUT 256 :
+//          lut[i] = (i - Nmin) * 255 / (Nmax - Nmin)
+//   FPGA : application de la MÊME LUT sur B, G et R de chaque pixel (1 pixel / cycle)
+//
+//   Pourquoi min/max des canaux et pas le niveau de gris ? Avec les bornes du gris
+//   (Nmin = 110), le canal bleu de la pelouse (~101) passait sous Nmin et était écrasé à 0
+//   sur 87 % de la pelouse : le seuillage G > B + seuil ne voulait plus rien dire.
+//   Avec ces bornes, aucun canal n'est écrasé et les écarts G-R, G-B sont simplement
+//   multipliés par le facteur 255 / (Nmax - Nmin).
+// =========================================================================================
+
+// Seuils pelouse dans l'espace NORMALISÉ = anciens seuils (15 et 25, image brute) multipliés
+// par le facteur d'étirement médian mesuré sur la vidéo de référence : 1.56 à 1.77, médiane 1.63
+const int SEUIL_PELOUSE_R_NORM = 24;   // ancien 15 x 1.63
+const int SEUIL_PELOUSE_B_NORM = 41;   // ancien 25 x 1.63
+
+// Calcule la LUT de normalisation à partir des canaux min / max de l'image (partie ARM)
+void calculerLUTNormalisation(const cv::Mat& bgr, uchar lut[256], int& n_min, int& n_max) {
+    int histo_min[256], histo_max[256];
+    for (int i = 0; i < 256; ++i) { histo_min[i] = 0; histo_max[i] = 0; }
+
+    int nb_echantillons = 0;
+    for (int y = 0; y < bgr.rows; y += 8) {
+        const cv::Vec3b* p = bgr.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < bgr.cols; x += 8) {
+            int b = p[x][0], g = p[x][1], r = p[x][2];
+            int c_min = std::min(b, std::min(g, r));
+            int c_max = std::max(b, std::max(g, r));
+            histo_min[c_min]++;
+            histo_max[c_max]++;
+            nb_echantillons++;
+        }
+    }
+
+    // Bornes 1 % / 99 % : on ignore les pixels extrêmes (reflets, ombres très noires)
+    int seuil = nb_echantillons / 100;
+    int cumul = 0;
+    n_min = 0;
+    for (int i = 0; i < 256; ++i) {
+        cumul += histo_min[i];
+        if (cumul > seuil) { n_min = i; break; }
+    }
+    cumul = 0;
+    n_max = 255;
+    for (int i = 255; i >= 0; --i) {
+        cumul += histo_max[i];
+        if (cumul > seuil) { n_max = i; break; }
+    }
+
+    if (n_max <= n_min) {
+        for (int i = 0; i < 256; ++i) lut[i] = static_cast<uchar>(i);
+        return;
+    }
+    for (int i = 0; i < 256; ++i) {
+        int v = ((i - n_min) * 255) / (n_max - n_min);
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        lut[i] = static_cast<uchar>(v);
+    }
+}
+
+// Applique la LUT sur les 3 canaux B, G, R (partie FPGA, IP normalisation_ip.vhd)
+void appliquerLUTCouleur(const cv::Mat& bgr, const uchar lut[256], cv::Mat& sortie) {
+    sortie.create(bgr.rows, bgr.cols, CV_8UC3);
+    for (int y = 0; y < bgr.rows; ++y) {
+        const cv::Vec3b* in = bgr.ptr<cv::Vec3b>(y);
+        cv::Vec3b* out = sortie.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < bgr.cols; ++x) {
+            out[x][0] = lut[in[x][0]];
+            out[x][1] = lut[in[x][1]];
+            out[x][2] = lut[in[x][2]];
+        }
+    }
+}
+
 // État de la sélection interactive par clic de souris
 struct GestionSouris {
     int x;
@@ -83,6 +163,7 @@ void onMouse(int event, int x, int y, int flags, void* userdata) {
 // Transmission des coordonnées des joueurs au format CSV
 void transmettreCoordonnees(std::ofstream& flux, int trame, const std::vector<JoueurTracke>& joueurs) {
     for (size_t i = 0; i < joueurs.size(); ++i) {
+        if (joueurs[i].frames_confirmation < 30) continue;   // piste pas encore confirmée
         flux << trame << "," << joueurs[i].id << ","
              << joueurs[i].corps.x << "," << joueurs[i].corps.y << "\n";
     }
@@ -170,7 +251,23 @@ int main(int argc, char* argv[]) {
     std::ofstream fichier_coords("coordonnees_joueurs.csv");
     fichier_coords << "trame,id,x,y\n";
 
-    const int MARGE = 35;
+    // Masque statique du terrain : quadrilatère des 4 coins, lignes de touche et de but effacées
+    // sur une bande de 12 px de chaque côté. Remplace l'ancienne bande rectangulaire de 35 px qui
+    // rendait invisibles les joueurs près de la ligne de touche (changement d'ID après un contact).
+    const int DEMI_LARGEUR_LIGNE = 12;
+    cv::Mat masque_terrain = cv::Mat::zeros(terrain.height, terrain.width, CV_8UC1);
+    std::vector<cv::Point> coins;
+    coins.push_back(pt_tl - terrain.tl());
+    coins.push_back(pt_tr - terrain.tl());
+    coins.push_back(pt_br - terrain.tl());
+    coins.push_back(pt_bl - terrain.tl());
+    cv::fillConvexPoly(masque_terrain, coins, cv::Scalar(255));
+    cv::polylines(masque_terrain, coins, true, cv::Scalar(0), 2 * DEMI_LARGEUR_LIGNE);
+    // Arcs de coin (rayon 1 m ~ 28 px) et drapeaux de corner effacés : disque de 40 px par coin
+    for (size_t k = 0; k < coins.size(); ++k) {
+        cv::circle(masque_terrain, coins[k], 40, cv::Scalar(0), cv::FILLED);
+    }
+
     std::vector<JoueurTracke> joueurs;
     int prochain_id = 1, num_trame = 0;
 
@@ -195,7 +292,15 @@ int main(int argc, char* argv[]) {
     std::cout << "[INFO] Cadence video regulee : " << fps << " FPS (" 
               << static_cast<int>(delai_nominal_ms) << " ms/trame)" << std::endl;
 
-    cv::Mat frame, zone_terrain, non_pelouse, rendu;
+    cv::Mat frame, zone_brute, zone_terrain, non_pelouse, rendu;
+
+    // LUT de normalisation initiale calculée sur la première trame. Ensuite, comme sur FPGA,
+    // la LUT appliquée à la trame N est celle calculée sur la trame N-1 (le flux passe avant
+    // qu'on connaisse ses statistiques).
+    uchar lut[256];
+    int n_min = 0, n_max = 255;
+    calculerLUTNormalisation(premiere_trame(terrain), lut, n_min, n_max);
+    std::cout << "[INFO] Normalisation initiale : Nmin=" << n_min << " Nmax=" << n_max << std::endl;
 
     // 2. Boucle de suivi vidéo temps réel
     while (true) {
@@ -203,22 +308,24 @@ int main(int argc, char* argv[]) {
         if (!cap.read(frame) || frame.empty()) break;
         num_trame++;
 
-        zone_terrain = frame(terrain);
+        // Normalisation (FPGA) avec la LUT de la trame précédente, puis LUT suivante (ARM)
+        zone_brute = frame(terrain);
+        appliquerLUTCouleur(zone_brute, lut, zone_terrain);
+        calculerLUTNormalisation(zone_brute, lut, n_min, n_max);
+
         non_pelouse.create(zone_terrain.rows, zone_terrain.cols, CV_8UC1);
 
         for (int y = 0; y < zone_terrain.rows; ++y) {
             const cv::Vec3b* in = zone_terrain.ptr<cv::Vec3b>(y);
             uchar* out = non_pelouse.ptr<uchar>(y);
             for (int x = 0; x < zone_terrain.cols; ++x) {
-                out[x] = (in[x][1] > in[x][2] + 15 && in[x][1] > in[x][0] + 25) ? 0 : 255;
+                out[x] = (in[x][1] > in[x][2] + SEUIL_PELOUSE_R_NORM &&
+                          in[x][1] > in[x][0] + SEUIL_PELOUSE_B_NORM) ? 0 : 255;
             }
         }
 
-        // Élimination des bordures extérieures
-        non_pelouse(cv::Rect(0, 0, zone_terrain.cols, MARGE)).setTo(0);
-        non_pelouse(cv::Rect(0, zone_terrain.rows - MARGE, zone_terrain.cols, MARGE)).setTo(0);
-        non_pelouse(cv::Rect(0, 0, MARGE, zone_terrain.rows)).setTo(0);
-        non_pelouse(cv::Rect(zone_terrain.cols - MARGE, 0, MARGE, zone_terrain.rows)).setTo(0);
+        // Élimination de l'extérieur du terrain et des lignes de bord
+        cv::bitwise_and(non_pelouse, masque_terrain, non_pelouse);
 
         // Détection candidats compacts (ratio < 2.5) et pleins (densité >= 0.22, rejetant les lignes creuses comme le rond central)
         std::vector<std::vector<cv::Point>> contours;
@@ -260,6 +367,7 @@ int main(int argc, char* argv[]) {
                 float gx = static_cast<float>(candidats[j].x + terrain.x);
                 float gy = static_cast<float>(candidats[j].y + terrain.y);
                 joueurs.push_back(creerNouveauJoueur(prochain_id++, gx, gy, couleurs_candidats[j]));
+                joueurs.back().frames_confirmation = 30;   // joueurs présents dès le départ : confirmés
             }
         } else {
             // Modèle cinétique prédictif (Kalman 1D / alpha-beta)
@@ -286,7 +394,9 @@ int main(int argc, char* argv[]) {
                         cv::Vec3f dc = joueurs[i].couleur - couleurs_candidats[j];
                         float d_couleur = std::sqrt(dc[0] * dc[0] + dc[1] * dc[1] + dc[2] * dc[2]);
 
-                        couts[i][j] = d_spatial + 0.6f * d_couleur;
+                        // Poids couleur 0.6 -> 0.37 : les écarts de couleur sont multipliés
+                        // par ~1.63 après normalisation (0.6 / 1.63 = 0.37)
+                        couts[i][j] = d_spatial + 0.37f * d_couleur;
                     }
                 }
                 assignations = tracking::resoudreHongrois(couts, 75.0f);
@@ -308,6 +418,10 @@ int main(int argc, char* argv[]) {
                     joueurs[i].couleur = 0.90f * joueurs[i].couleur + 0.10f * couleurs_candidats[c_idx];
                     deplacerJoueur(joueurs[i], gx, gy);
                     joueurs[i].frames_sans_mesure = 0;
+                    joueurs[i].frames_confirmation++;
+                } else if (joueurs[i].frames_confirmation < 30) {
+                    // Piste non confirmée sans candidat direct : pas de fallback, elle sera supprimée
+                    joueurs[i].frames_sans_mesure++;
                 } else {
                     // Fallback local sur les lignes blanches (fenêtre 28x28) : évite le lag et la perte d'ID
                     int lx = static_cast<int>(pos_predites[i].x - terrain.x);
@@ -376,9 +490,13 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // 7. Nettoyage des pistes perdues après disparition prolongée (> 90 trames = 1.5s)
+        // 7. Nettoyage des pistes perdues après disparition prolongée (> 90 trames = 3 s)
+        //    et des pistes non confirmées : une piste créée en cours de vidéo doit être associée
+        //    directement à un candidat pendant 30 trames (1 s) avant de pouvoir utiliser le fallback.
+        //    Évite qu'un résidu de ligne blanche devienne un joueur fantôme accroché à la ligne.
         for (size_t i = 0; i < joueurs.size(); ) {
-            if (joueurs[i].frames_sans_mesure > 90) {
+            bool non_confirme = joueurs[i].frames_confirmation < 30 && joueurs[i].frames_sans_mesure > 0;
+            if (joueurs[i].frames_sans_mesure > 90 || non_confirme) {
                 if (joueurs[i].id == souris.id_selectionne) souris.id_selectionne = -1;
                 joueurs.erase(joueurs.begin() + i);
             } else {
@@ -405,6 +523,7 @@ int main(int argc, char* argv[]) {
 
         // Rendu visuel (boîtes, corps, identifiants, déport vertical en cas de duel serré)
         for (size_t i = 0; i < joueurs.size(); ++i) {
+            if (joueurs[i].frames_confirmation < 30) continue;   // piste pas encore confirmée
             bool sel = (joueurs[i].id == souris.id_selectionne);
             cv::Scalar col = sel ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 255, 255);
             cv::rectangle(frame, joueurs[i].boite, col, sel ? 3 : 2);
