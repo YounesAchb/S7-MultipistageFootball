@@ -38,3 +38,31 @@ target_link_libraries(tracking_vue_haut ${OpenCV_LIBS})
 # 7. Programme de test et simulation de l'IP de normalisation d'image FPGA : test_normalisation_fpga
 add_executable(test_normalisation_fpga src/fpga/test_normalisation_fpga.cpp)
 target_link_libraries(test_normalisation_fpga ${OpenCV_LIBS})
+
+
+# ===== Calibration et homographie - Badr =====
+
+add_executable(calibration_vue_haut
+    src/calibration_vue_haut.cpp
+)
+target_link_libraries(calibration_vue_haut PRIVATE ${OpenCV_LIBS})
+
+add_executable(calibration_auto_vue_haut
+    src/calibration_auto_vue_haut.cpp
+)
+target_link_libraries(calibration_auto_vue_haut PRIVATE ${OpenCV_LIBS})
+
+add_executable(calibration_soccertrack
+    src/calibration_soccertrack.cpp
+)
+target_link_libraries(calibration_soccertrack PRIVATE ${OpenCV_LIBS})
+
+add_executable(test_projection
+    src/test_projection.cpp
+)
+target_link_libraries(test_projection PRIVATE ${OpenCV_LIBS})
+
+add_executable(verification_keypoints
+    src/verification_keypoints.cpp
+)
+target_link_libraries(verification_keypoints PRIVATE ${OpenCV_LIBS})
